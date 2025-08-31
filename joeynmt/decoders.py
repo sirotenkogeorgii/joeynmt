@@ -506,6 +506,7 @@ class TransformerDecoder(Decoder):
         emb_dropout: float = 0.1,
         vocab_size: int = 1,
         freeze: bool = False,
+        use_cache: bool = False,
         **kwargs,
     ):
         """
@@ -519,12 +520,15 @@ class TransformerDecoder(Decoder):
         :param emb_dropout: dropout probability for embeddings
         :param vocab_size: size of the output vocabulary
         :param freeze: set to True keep all decoder parameters fixed
+        :param use_cache: whether to cache keys and values or not 
         :param kwargs:
         """
         super().__init__()
 
         self._hidden_size = hidden_size
         self._output_size = vocab_size
+
+        self.use_cache = use_cache
 
         # create num_layers decoder layers and put them in a list
         self.layers = nn.ModuleList([
@@ -536,6 +540,7 @@ class TransformerDecoder(Decoder):
                 alpha=kwargs.get("alpha", 1.0),
                 layer_norm=kwargs.get("layer_norm", "post"),
                 activation=kwargs.get("activation", "relu"),
+                use_cache=use_cache
             ) for _ in range(num_layers)
         ])
 
@@ -550,6 +555,17 @@ class TransformerDecoder(Decoder):
 
         if freeze:
             freeze_params(self)
+            
+        # Initialize cache position counter (will be batch-aware)
+        if self.use_cache:
+            self._cache_position = None  # Will be initialized per batch
+
+    def clear_cache(self):
+        for layer in self.layers:
+            layer.clear_cache()
+        # Reset position counter for positional encoding
+        if self.use_cache:
+            self._cache_position = None  # Will be re-initialized per batch
 
     def forward(
         self,
@@ -582,12 +598,68 @@ class TransformerDecoder(Decoder):
         """
         assert trg_mask is not None, "trg_mask required for Transformer"
 
-        x = self.pe(trg_embed)  # add position encoding to word embedding
+        # Add position encoding to word embedding
+        # For KV cache, we need to account for the current position (batch-aware)
+        if self.use_cache:
+            batch_size = trg_embed.size(0)
+            seq_len = trg_embed.size(1)
+            
+            # Initialize position counter if needed (batch-aware)
+            if self._cache_position is None:
+                self._cache_position = torch.zeros(batch_size, dtype=torch.long, device=trg_embed.device)
+                # self._cache_position.shape = [batch_size]
+            
+
+
+            
+            # During incremental generation, adjust position encoding
+            # trg_embed.shape = [bs, seq_len]
+            if seq_len == 1:  # Single token input (incremental)
+                # Extract the correct positional encoding for current position (per batch element)
+                # pe_slices = []
+                # for batch_idx in range(batch_size):
+                #     current_pos = self._cache_position[batch_idx].item()
+                #     pe_slice = self.pe.pe[:, current_pos:current_pos+1]
+                #     pe_slices.append(pe_slice)
+                
+                # # Stack the positional encodings for the batch
+                # pe_batch = torch.cat(pe_slices, dim=0)
+                # x = trg_embed + pe_batch
+                # print(f"{pe_batch.shape=}, {trg_embed.shape=}, {x.shape=}")
+                # # pe_batch.shape=torch.Size([2, 1, 12]), trg_embed.shape=torch.Size([2, 1, 12]), x.shape=torch.Size([2, 1, 12])
+
+                if self._cache_position.size(0) != batch_size:
+                    raise ValueError(f"KV cache batch size mismatch: expected {batch_size}, but got {self._cache_position.size(0)}")
+                
+                pe_batch = self.pe.pe[0, self._cache_position].unsqueeze(1) # shape: [1, bs, emb_dim]
+                x = trg_embed + pe_batch
+                # print(f"{pe_batch.shape=}, {trg_embed.shape=}, {x.shape=}")
+                # pe_batch.shape=torch.Size([1, 2, 12]), trg_embed.shape=torch.Size([2, 1, 12]), x.shape=torch.Size([2, 2, 12])
+                
+                # Increment position counter for each batch element
+                self._cache_position += 1
+            else:
+                # Full sequence input, reset position and use normal PE
+                self._cache_position = torch.full((batch_size,), trg_embed.size(1), 
+                                                dtype=torch.long, device=trg_embed.device)
+                x = self.pe(trg_embed)
+        else:
+            # Normal operation without cache
+            x = self.pe(trg_embed)
         if kwargs.get("trg_prompt_mask", None) is not None:  # add trg_prompt_mask
             x = x + kwargs["trg_prompt_mask"]
         x = self.emb_dropout(x)
 
+        """
+        def subsequent_mask(size: int) -> Tensor:
+        # Mask out subsequent positions (to prevent attending to future positions)
+        # Transformer helper function.
+        ones = torch.ones(size, size, dtype=torch.bool)
+        return torch.tril(ones, out=ones).unsqueeze(0)
+        """
+
         trg_mask = trg_mask & subsequent_mask(trg_embed.size(1)).type_as(trg_mask)
+        # print(f"[TransformerDecoder.forward] {trg_mask=}")
 
         last_layer = len(self.layers) - 1
         return_attention = kwargs.get("return_attention", False)
@@ -612,5 +684,6 @@ class TransformerDecoder(Decoder):
             f"num_heads={self.layers[0].trg_trg_att.num_heads}, "
             f"alpha={self.layers[0].alpha}, "
             f'layer_norm="{self.layers[0]._layer_norm_position}", '
-            f"activation={self.layers[0].feed_forward.pwff_layer[1]})"
+            f"activation={self.layers[0].feed_forward.pwff_layer[1]}, "
+            f"use_cache={self.use_cache})"
         )

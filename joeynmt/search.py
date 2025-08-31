@@ -163,6 +163,7 @@ def transformer_greedy(
     model: Model,
     encoder_output: Tensor,
     encoder_hidden: Tensor,
+    use_cache: bool = False,
     **kwargs,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """
@@ -174,6 +175,7 @@ def transformer_greedy(
     :param model: model to use for greedy decoding
     :param encoder_output: encoder hidden states for attention
     :param encoder_hidden: encoder final state (unused in Transformer)
+    :param use_cache: whether to use KV cache for faster inference
     :return:
         - stacked_output: output hypotheses (2d array of indices),
         - stacked_scores: scores (2d array of token-wise log probabilities),
@@ -221,6 +223,10 @@ def transformer_greedy(
 
     finished = src_mask.new_zeros((batch_size, 1)).byte()
 
+    # Clear any existing cache if using KV cache
+    if use_cache and hasattr(model.decoder, 'clear_cache'):
+        model.decoder.clear_cache()
+
     for step in range(max_output_length):
         # `forced_word` shape: (batch_size, 1)
         forced_word = decoder_prompt[:, step + 1].unsqueeze(1) \
@@ -235,18 +241,31 @@ def transformer_greedy(
         if torch.any(~forced_word_mask).item():
             with torch.autocast(**autocast):
                 with torch.no_grad():
+                    # Determine input based on cache setting
+                    if use_cache and step > 0:
+                        # With cache: feed only the last token
+                        trg_input = ys[:, -1:]  # Only the last token
+                        # Adjust mask for cache: current token can attend to all cached positions
+                        current_seq_len = ys.size(1)  # Total sequence length so far
+                        trg_mask_for_cache = src_mask.new_ones([batch_size, 1, current_seq_len])
+                    else:
+                        # Without cache or first step: feed the full sequence
+                        trg_input = ys  # Full sequence
+                        trg_mask_for_cache = trg_mask
+                    
                     log_probs, _, att, _ = model(
                         return_type="decode",
-                        trg_input=ys,  # model.trg_embed(ys) # embed the previous tokens
+                        trg_input=trg_input,  # Use appropriate input
                         encoder_output=encoder_output,
                         encoder_hidden=None,
                         src_mask=src_mask,
                         unroll_steps=None,
                         decoder_hidden=None,
-                        trg_mask=trg_mask,
+                        trg_mask=trg_mask_for_cache,  # Use cache-adjusted mask
                         return_attention=return_attn,
+                        use_cache=use_cache,  # Pass cache flag to model
                         trg_prompt_mask=adjust_mask_size(
-                            trg_prompt_mask, batch_size, ys.size(1)
+                            trg_prompt_mask, batch_size, trg_input.size(1)
                         ),
                     )
 

@@ -58,6 +58,7 @@ def predict(
     num_workers: int = 0,
     args: TestConfig = None,
     autocast: Dict = None,
+    use_cache: bool = False,
 ) -> Tuple[Dict[str, float], Optional[List[str]], Optional[List[str]], List[List[str]],
            List[np.ndarray], List[np.ndarray]]:
     """
@@ -214,6 +215,7 @@ def predict(
                     repetition_penalty=args.repetition_penalty,
                     no_repeat_ngram_size=args.no_repeat_ngram_size,
                     autocast=autocast,
+                    use_cache=use_cache
                 )
 
             if use_ddp():
@@ -532,6 +534,7 @@ def test(
                 normalization=args.train.normalization,
                 args=args.test,
                 autocast=args.autocast,
+                use_cache=cfg["testing"].get("use_cache", False)
             )
 
             if save_attention:

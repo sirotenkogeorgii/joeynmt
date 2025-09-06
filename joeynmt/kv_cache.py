@@ -3,6 +3,13 @@ from typing import Optional, List, Tuple, Union
 from abc import ABC, abstractmethod
 import torch
 from torch import Tensor, nn
+from enum import Enum
+
+
+
+class KVCacheImpl(str, Enum):
+    pointer = "pointer"
+    stack = "stack"
 
 
 
@@ -221,6 +228,7 @@ class KVCacheStack(MutableKVCache):
         return self.valid_token_mask
 
     def update_cache(self, new_self_kv, valid_token_mask_new):
+        # print("KVCacheStack")
         bs, num_heads, seq_new, head_dim = new_self_kv[0][0].shape
 
         if valid_token_mask_new is not None:
@@ -348,6 +356,7 @@ class KVCachePointer(MutableKVCache):
 
     
     def update_cache(self, new_self_kv, valid_token_mask_new):
+        # print("KVCachePointer")
         bs, num_heads, seq_new, head_dim = new_self_kv[0][0].shape
 
         if valid_token_mask_new is not None:
@@ -440,33 +449,12 @@ class KVCachePointer(MutableKVCache):
             target_idx_flat = target_idx.repeat_interleave(num_heads, 0)           # [bh, seq_new]
             mask_flat = time_valid.repeat_interleave(num_heads, 0)                 # [bh, seq_new]
 
+            # if time_valid_flat.any():
             row_ids = torch.arange(bh, device=k_new.device)[:, None].expand(bh, seq_new)
             rows = row_ids[mask_flat]
             cols = target_idx_flat[mask_flat]
             k_dest_flat[rows, cols] = k_src_flat[mask_flat]
             v_dest_flat[rows, cols] = v_src_flat[mask_flat]
-
-        # # Compute compacted target indices using cumsum over valid tokens
-        # # local_idx[b,t] = number of valid tokens up to t (inclusive) - 1, for valid positions only
-        # local_idx = time_valid.long().cumsum(dim=1) - 1                  # [bs, seq_new]
-        # local_idx = local_idx.masked_fill(~time_valid, 0)
-        # start_pos = self.positions_offset.to(device)                     # [bs]
-        # target_idx = start_pos[:, None] + local_idx                      # [bs, seq_new]
-
-        # target_idx_flat = target_idx.repeat_interleave(num_heads, dim=0)  # [bh, seq_new]
-        # time_valid_flat = time_valid.repeat_interleave(num_heads, dim=0)  # [bh, seq_new]
-
-        # # Zero-out invalid source entries to avoid writing them
-        # # Advanced indexing write only for valid positions to avoid collisions/overwrites
-        # if time_valid_flat.any():
-        #     row_ids = torch.arange(bh, device=device).unsqueeze(1).expand(bh, seq_new)  # [bh, seq_new]
-        #     rows = row_ids[time_valid_flat]              # (N,)
-        #     cols = target_idx_flat[time_valid_flat]      # (N,)
-        #     k_vals = k_src_flat[time_valid_flat]         # (N, head_dim)
-        #     v_vals = v_src_flat[time_valid_flat]         # (N, head_dim)
-
-        #     k_dest_flat[rows, cols] = k_vals
-        #     v_dest_flat[rows, cols] = v_vals
 
         # Save back
         self.keys[layer_i] = k_dest_flat.view(bs, num_heads, self.cache_len, head_dim)
@@ -508,7 +496,6 @@ class KVCachePointer(MutableKVCache):
         """Compatibility: compute mask on-the-fly from positions_offset."""
         return self.get_active_cache_mask()
 
-    
 
 
 class EncoderDecoderCache:
@@ -518,20 +505,20 @@ class EncoderDecoderCache:
         cross_attention_cache: Union[KVCache, List[Tuple[Tensor, Tensor]], None] = None,
         self_valid_token_mask: Optional[Tensor] = None,   # [bs, trg_time_dim]
         cross_valid_token_mask: Optional[Tensor] = None,  # [bs, src_time_dim]
+        self_impl: Union[str, "KVCacheImpl"] = "pointer",  # NEW
     ):
         """
         Wrapper holding self- and cross-attention caches.
-
-        You may pass either KVCache instances or lists of per-layer (k, v) tensors
-        to initialize new caches.
         """
+        # print(f"{self_impl=}")
+        # NEW: normalize and store impl for future cache (re)creation
+        self.self_impl = KVCacheImpl(self_impl) if isinstance(self_impl, str) else self_impl
+
         # Self-attention cache (dynamic)
-        # if isinstance(self_attention_cache, (KVCacheStack, KVCachePointer)) or self_attention_cache is None:
         if isinstance(self_attention_cache, MutableKVCache) or self_attention_cache is None:
             self.self_attention_cache = self_attention_cache
         elif isinstance(self_attention_cache, list):
-            # self.self_attention_cache = KVCacheStack(self_attention_cache, valid_token_mask=self_valid_token_mask)
-            self.self_attention_cache = KVCachePointer(self_attention_cache, valid_token_mask=self_valid_token_mask)
+            self.self_attention_cache = build_mutable_kv_cache(self.self_impl, self_attention_cache, valid_token_mask=self_valid_token_mask)
         else:
             raise TypeError("Invalid type for self_attention_cache")
 
@@ -539,7 +526,6 @@ class EncoderDecoderCache:
         if isinstance(cross_attention_cache, StaticKVCache) or cross_attention_cache is None:
             self.cross_attention_cache = cross_attention_cache
         elif isinstance(cross_attention_cache, list):
-            # print(f"{cross_attention_cache[0][0].shape=}, {cross_attention_cache[0][0].shape=}")
             self.cross_attention_cache = StaticKVCache(cross_attention_cache, valid_token_mask=cross_valid_token_mask)
         else:
             raise TypeError("Invalid type for cross_attention_cache")
@@ -547,45 +533,24 @@ class EncoderDecoderCache:
 
     def update_decoder_cache(
         self,
-        new_self_kv: List[Tuple[Tensor, Tensor]] = None, # [num_layers, 2, batch_size, num_heads, seq_len, head_dim]
-        new_cross_kv: List[Tuple[Tensor, Tensor]] = None, # [num_layers, 2, batch_size, num_heads, seq_len, head_dim]
-        self_valid_token_mask_new: Optional[Tensor] = None,   # [bs, seq_new]
-        cross_valid_token_mask_new: Optional[Tensor] = None,  # [bs, seq_new]
+        new_self_kv: List[Tuple[Tensor, Tensor]] = None,
+        new_cross_kv: List[Tuple[Tensor, Tensor]] = None,
+        self_valid_token_mask_new: Optional[Tensor] = None,
+        cross_valid_token_mask_new: Optional[Tensor] = None,
     ) -> None:
         """
         Update caches with new per-layer KV tuples.
-        For self-attention (dynamic), append new KV entries.
-        For cross-attention (static), initialize once if not present.
         """
         # Update self-attention dynamic cache
         if new_self_kv is not None:
             if self.self_attention_cache is None:
-                # TODO: Add other KV Caches
-                # self.self_attention_cache = KVCacheStack(new_self_kv, valid_token_mask=self_valid_token_mask_new)
-                self.self_attention_cache = KVCachePointer(new_self_kv, valid_token_mask=self_valid_token_mask_new)
+                self.self_attention_cache = build_mutable_kv_cache(self.self_impl, new_self_kv, valid_token_mask=self_valid_token_mask_new)
             else:
-                # TODO: I think it's better to offload update onto the kv cache itself
                 assert len(new_self_kv) == self.self_attention_cache.num_layers
-                # Determine per-example steps from mask if provided
-                if self_valid_token_mask_new is not None:
-                    # steps = self_valid_token_mask_new.to(dtype=torch.long).sum(dim=1)
-                    pass
-                else:
-                    # seq_new = new_self_kv[0][0].size(2)
-                    # steps = torch.full(
-                    #     (self.self_attention_cache.batch_size,),
-                    #     seq_new,
-                    #     dtype=torch.long,
-                    pass
-                # for layer_i, (k_new, v_new) in enumerate(new_self_kv):
-                #     self.self_attention_cache.update_layer(layer_i, k_new, v_new, valid_token_mask_new=self_valid_token_mask_new)
                 self.self_attention_cache.update_cache(new_self_kv, valid_token_mask_new=self_valid_token_mask_new)
-                # self.self_attention_cache.advance_positions_by(steps)
 
         # Initialize cross-attention static cache once
         if new_cross_kv is not None and self.cross_attention_cache is None:
-            # TODO: Add other KV Caches (???)
-            # TODO: Add KVCacheStatic
             self.cross_attention_cache = StaticKVCache(new_cross_kv, valid_token_mask=cross_valid_token_mask_new)
 
     def get_layer(self, layer_i):
@@ -618,8 +583,6 @@ class EncoderDecoderCache:
     def index_select(self, index: Tensor):
         """
         Return a new EncoderDecoderCache reindexed along the batch dimension using `index`.
-
-        This reorders both self- and cross-attention caches consistently with beam selection.
         """
         self_cache = self.self_attention_cache.index_select(index) if self.has_self_attention_cache() else None
         cross_cache = self.cross_attention_cache.index_select(index) if self.has_cross_attention_cache() else None
@@ -633,4 +596,20 @@ class EncoderDecoderCache:
             cross_attention_cache=cross_cache,
             self_valid_token_mask=self_valid,
             cross_valid_token_mask=cross_valid,
+            self_impl=self.self_impl,
         )
+    
+
+
+def build_mutable_kv_cache(
+    impl: Union[str, "KVCacheImpl"],
+    layers_kv: List[Tuple[Tensor, Tensor]],
+    valid_token_mask: Optional[Tensor] = None,
+) -> "MutableKVCache":
+    if isinstance(impl, str):
+        impl = KVCacheImpl(impl)
+    if impl == KVCacheImpl.pointer:
+        return KVCachePointer(layers_kv, valid_token_mask=valid_token_mask)
+    if impl == KVCacheImpl.stack:
+        return KVCacheStack(layers_kv, valid_token_mask=valid_token_mask)
+    raise ValueError(f"Unknown kv cache impl: {impl}")

@@ -163,7 +163,7 @@ def transformer_greedy(
     model: Model,
     encoder_output: Tensor,
     encoder_hidden: Tensor,
-    use_cache: bool = False,
+    # use_cache: bool = False,
     **kwargs,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """
@@ -205,6 +205,8 @@ def transformer_greedy(
         return_prob or repetition_penalty > 0 or no_repeat_ngram_size > 0
         or encoder_input is not None
     )
+    use_cache = kwargs.get("use_cache", False)
+    kv_cache_impl = kwargs.get("kv_cache_impl", None)
 
     # start with BOS-symbol for each sentence in the batch
     ys = encoder_output.new_full((batch_size, 1), bos_index, dtype=torch.long)
@@ -223,10 +225,7 @@ def transformer_greedy(
 
     finished = src_mask.new_zeros((batch_size, 1)).byte()
 
-    # Clear any existing cache if using KV cache
-    if use_cache and hasattr(model.decoder, 'clear_cache'):
-        model.decoder.clear_cache()
-
+    kv_cache = None
     for step in range(max_output_length):
         # `forced_word` shape: (batch_size, 1)
         forced_word = decoder_prompt[:, step + 1].unsqueeze(1) \
@@ -246,14 +245,16 @@ def transformer_greedy(
                         # With cache: feed only the last token
                         trg_input = ys[:, -1:]  # Only the last token
                         # Adjust mask for cache: current token can attend to all cached positions
-                        current_seq_len = ys.size(1)  # Total sequence length so far
-                        trg_mask_for_cache = src_mask.new_ones([batch_size, 1, current_seq_len])
+                        # current_seq_len = ys.size(1)  # Total sequence length so far
+                        # trg_mask_for_cache = src_mask.new_ones([batch_size, 1, current_seq_len])
+                        trg_mask_for_cache = src_mask.new_ones([batch_size, 1, 1])
                     else:
                         # Without cache or first step: feed the full sequence
                         trg_input = ys  # Full sequence
                         trg_mask_for_cache = trg_mask
                     
-                    log_probs, _, att, _ = model(
+
+                    log_probs, _, att, kv_cache = model(
                         return_type="decode",
                         trg_input=trg_input,  # Use appropriate input
                         encoder_output=encoder_output,
@@ -264,6 +265,8 @@ def transformer_greedy(
                         trg_mask=trg_mask_for_cache,  # Use cache-adjusted mask
                         return_attention=return_attn,
                         use_cache=use_cache,  # Pass cache flag to model
+                        past_key_values=kv_cache,
+                        kv_cache_impl=kv_cache_impl,
                         trg_prompt_mask=adjust_mask_size(
                             trg_prompt_mask, batch_size, trg_input.size(1)
                         ),
@@ -409,6 +412,8 @@ def beam_search(
     encoder_input: Tensor = kwargs.get("encoder_input", None)  # for repetition blocker
     decoder_prompt: Tensor = kwargs.get("decoder_prompt", None)  # for forced decoding
     trg_prompt_mask: Tensor = kwargs.get("trg_prompt_mask", None)  # for forced decoding
+    use_cache = kwargs.get("use_cache", False)
+    kv_cache_impl = kwargs.get("kv_cache_impl", None)
 
     trg_vocab_size = model.decoder.output_size
     device = encoder_output.device
@@ -419,6 +424,7 @@ def beam_search(
     att_vectors = None  # for RNN only, not used for Transformer
     hidden = None  # for RNN only, not used for Transformer
     trg_mask = None  # for Transformer only, not used for RNN
+    kv_cache = None  # Transformer-only KV cache holder
 
     # Recurrent models only: initialize RNN hidden state
     if not is_transformer:
@@ -444,21 +450,15 @@ def beam_search(
 
     # `encoder_input` shape: (batch_size * beam_size, src_len)
     if encoder_input is not None:  # used in src-side repetition blocker
-        encoder_input = tile(encoder_input.contiguous(), beam_size,
-                             dim=0).view(batch_size * beam_size, -1)
-        assert encoder_input.size(0) == batch_size * beam_size, (
-            encoder_input.size(0),
-            batch_size * beam_size,
-        )
+        encoder_input = tile(encoder_input.contiguous(), beam_size, dim=0).view(batch_size * beam_size, -1)
+        assert encoder_input.size(0) == batch_size * beam_size, (encoder_input.size(0), batch_size * beam_size)
 
     # `decoder_prompt` shape: (batch_size * beam_size, trg_prompt_len)
     if decoder_prompt is not None:  # used in forced decoding
-        decoder_prompt = tile(decoder_prompt.contiguous(), beam_size,
-                              dim=0).view(batch_size * beam_size, -1)
+        decoder_prompt = tile(decoder_prompt.contiguous(), beam_size, dim=0).view(batch_size * beam_size, -1)
         assert decoder_prompt.size(0) == batch_size * beam_size
     if trg_prompt_mask is not None:
-        trg_prompt_mask = tile(trg_prompt_mask.contiguous(), beam_size,
-                               dim=0).view(batch_size * beam_size, -1)
+        trg_prompt_mask = tile(trg_prompt_mask.contiguous(), beam_size, dim=0).view(batch_size * beam_size, -1)
         assert trg_prompt_mask.size(0) == batch_size * beam_size
         assert decoder_prompt.size(1) == trg_prompt_mask.size(1)
 
@@ -466,9 +466,7 @@ def beam_search(
     if is_transformer:
         trg_mask = src_mask.new_ones([1, 1, 1])
         if isinstance(model, DataParallelWrapper):
-            trg_mask = torch.stack([
-                src_mask.new_ones([1, 1]) for _ in model.device_ids
-            ])
+            trg_mask = torch.stack([src_mask.new_ones([1, 1]) for _ in model.device_ids])
 
     # numbering elements in the batch
     # batch_offset = [0, 1, 2, 3, 4] when batch_size = 5
@@ -476,17 +474,12 @@ def beam_search(
 
     # numbering elements in the extended batch, i.e. k copies of each batch element
     # beam_offset = [0, 2, 4, 6, 8] when batch_size = 5, beam_size = 2
-    beam_offset = torch.arange(
-        0, batch_size * beam_size, step=beam_size, dtype=torch.long, device=device
-    )
+    beam_offset = torch.arange(0, batch_size * beam_size, step=beam_size, dtype=torch.long, device=device)
 
     # keeps track of the top beam size hypotheses to expand for each element in the
     # batch to be further decoded (that are still "alive")
     # `alive_seq` shape: (batch_size * beam_size, hyp_len) ... now hyp_len = 1
-    alive_seq = torch.full((batch_size * beam_size, 1),
-                           bos_index,
-                           dtype=torch.long,
-                           device=device)
+    alive_seq = torch.full((batch_size * beam_size, 1), bos_index, dtype=torch.long, device=device)
 
     # Give full probability (=zero in log space) to the first beam on the first step.
     # `topk_log_probs` shape: (batch_size, beam_size)
@@ -504,10 +497,7 @@ def beam_search(
 
     # indicator if the generation is finished
     # `is_finished` shape: (batch_size, beam_size)
-    is_finished = torch.full((batch_size, beam_size),
-                             False,
-                             dtype=torch.bool,
-                             device=device)
+    is_finished = torch.full((batch_size, beam_size), False, dtype=torch.bool, device=device)
 
     for step in range(max_output_length):
         # `forced_token_ids` shape: (remaining_batch_size * beam_size,)
@@ -518,9 +508,7 @@ def beam_search(
         padding_mask = trg_prompt_mask[:, step + 1].bool() \
             if trg_prompt_mask is not None and trg_prompt_mask.size(1) > step + 1 \
             else torch.zeros((current_batch_size,), dtype=torch.bool, device=device)
-        _log_probs_idx = torch.arange(
-            current_batch_size, dtype=torch.long, device=device
-        )
+        _log_probs_idx = torch.arange(current_batch_size, dtype=torch.long, device=device)
         _log_probs_val = torch.zeros(current_batch_size, dtype=dtype, device=device)
 
         if torch.any(~padding_mask).item():
@@ -531,18 +519,29 @@ def beam_search(
                 # decode one single step
                 with torch.autocast(**autocast):
                     with torch.no_grad():
-                        logits, _, _, _ = model(  # logits before final softmax
+                        if use_cache and step > 0:
+                            # Cache path: feed only last token, adjust mask
+                            decoder_input = alive_seq[:, -1:].contiguous()
+                            local_trg_mask = src_mask.new_ones([decoder_input.size(0), 1, 1])
+                        else:
+                            # No cache / first step: full sequence
+                            decoder_input = alive_seq
+                            local_trg_mask = trg_mask
+
+                        logits, _, _, kv_cache = model(  # logits before final softmax
                             return_type="decode",
-                            encoder_output=encoder_output,
-                            encoder_hidden=None,  # only for initializing decoder_hidden
+                            encoder_output=encoder_output, # (batch*beam, src_len, enc_hidden)
+                            encoder_hidden=None,
                             src_mask=src_mask,
-                            trg_input=decoder_input,  # trg_embed = embed(decoder_input)
-                            decoder_hidden=None,  # don't need this for transformer
-                            att_vector=None,  # don't need this for transformer
+                            trg_input=decoder_input,
+                            decoder_hidden=None,
+                            att_vector=None,
                             unroll_steps=1,
-                            trg_mask=trg_mask,  # subsequent mask for Transformer only
-                            trg_prompt_mask=adjust_mask_size(  # prompt mask
-                                trg_prompt_mask, current_batch_size, alive_seq_len),
+                            trg_mask=local_trg_mask,
+                            trg_prompt_mask=adjust_mask_size(trg_prompt_mask, current_batch_size, decoder_input.size(1)),
+                            use_cache=use_cache,
+                            past_key_values=kv_cache,
+                            kv_cache_impl=kv_cache_impl
                         )
 
                 # For the Transformer we made predictions for all time steps up to this
@@ -575,7 +574,7 @@ def beam_search(
 
             # compute log probability distribution over trg vocab
             # `log_probs` shape: (remaining_batch_size * beam_size, trg_vocab)
-            log_probs = F.log_softmax(logits, dim=-1)
+            log_probs = F.log_softmax(logits, dim=-1) # (remaining_batch_size * beam_size, trg_vocab)
 
             # block repetitions
             if no_repeat_ngram_size > 0:
@@ -767,8 +766,7 @@ def beam_search(
             # but only the candidates that finished in the very current time step.
             # TODO: release the space of finished ones, explore more unfinished ones.
             # `alive_seq` shape: (remaining_batch_size * beam_size, hyp_len)
-            alive_seq = predictions.index_select(0, unfinished
-                                                 ).view(-1, alive_seq.size(-1))
+            alive_seq = predictions.index_select(0, unfinished).view(-1, alive_seq.size(-1))
 
             if encoder_input is not None:
                 src_len = encoder_input.size(1)
@@ -789,10 +787,14 @@ def beam_search(
                 assert trg_prompt_mask.size(0) == alive_seq.size(0)
                 assert decoder_prompt.size(1) == trg_prompt_mask.size(1)
 
-        # reorder indices, outputs and masks
+        # reorder indices, outputs and masks (and KV cache if used)
         select_indices = batch_index.view(-1)
+        # print(select_indices)
         encoder_output = encoder_output.index_select(0, select_indices)
         src_mask = src_mask.index_select(0, select_indices)
+        if is_transformer and use_cache and kv_cache is not None:
+            # Reorder KV cache to follow beam selection
+            kv_cache = kv_cache.index_select(select_indices)
 
         if hidden is not None and not is_transformer:
             if isinstance(hidden, tuple):

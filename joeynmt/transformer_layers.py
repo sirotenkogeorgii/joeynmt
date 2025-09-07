@@ -55,17 +55,17 @@ class MultiHeadedAttention(nn.Module):
             raise ValueError('Cache type must be "static", "dynamic", or None.')
         self.kv_cache_type = kv_cache_type
 
-        if self.kv_cache_type:
-            self.register_buffer("k_cache", None, persistent=False)
-            self.register_buffer("v_cache", None, persistent=False)
+        # if self.kv_cache_type:
+        #     self.register_buffer("k_cache", None, persistent=False)
+        #     self.register_buffer("v_cache", None, persistent=False)
 
         # 1) in cross-attention kv cache is static that is computed only once
         # 2) in self-attention kv cache is dynamic that is static only for a prefix in a time step t-1 and is updated every time step
 
 
-    def clear_cache(self):
-        self.k_cache = None
-        self.v_cache = None
+    # def clear_cache(self):
+    #     self.k_cache = None
+    #     self.v_cache = None
 
     def forward(
         self,
@@ -74,7 +74,8 @@ class MultiHeadedAttention(nn.Module):
         q: Tensor,
         mask: Optional[Tensor] = None,
         return_weights: Optional[bool] = None,
-        use_cache: bool = False
+        use_cache: bool = False,
+        past_key_values: tuple[Tensor, Tensor] = None
     ):
         """
         Computes multi-headed attention.
@@ -90,76 +91,31 @@ class MultiHeadedAttention(nn.Module):
             - attention_weights  [batch_size, query_len, key_len]
         """
         batch_size = k.size(0)
-        key_len = k.size(1)
-        query_len = q.size(1)
-
-        # project the queries (q)
-        q = self.q_layer(q)
 
         # reshape q for our computation to [batch_size, num_heads, seq_len, head_dim]
-        q = q.view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2)
+        q = self.q_layer(q).view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2) # project input queries
 
-        ############################## KV Cache Implementation (Batch-Aware) ###################################
-        # if use_cache and self.kv_cache_type:
-        #     if self.kv_cache_type == "dynamic":
-        #         # Dynamic cache for self-attention: build cache incrementally (batch-aware)
-        #         if self.k_cache is not None:
-        #             # Verify batch size consistency
-        #             if self.k_cache.size(0) != batch_size:
-        #                 # Batch size changed, reinitialize cache
-        #                 self.k_cache = None
-        #                 self.v_cache = None
+        if self.kv_cache_type == "static" and past_key_values:
+            k_new, v_new = past_key_values
+            k, v = k_new, v_new
                 
-        #         if self.k_cache is not None:
-        #             # Append new tokens to existing cache
-        #             new_k = self.k_layer(k).view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2)
-        #             new_v = self.v_layer(v).view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2)
-                    
-        #             # If input has only 1 token (incremental), append it
-        #             if new_k.size(2) == 1:
-        #                 self.k_cache = torch.cat([self.k_cache, new_k], dim=2)
-        #                 self.v_cache = torch.cat([self.v_cache, new_v], dim=2)
-        #             else:
-        #                 # If input has multiple tokens, replace cache entirely
-        #                 self.k_cache = new_k
-        #                 self.v_cache = new_v
-        #         else:
-        #             # Initialize cache (batch-aware)
-        #             self.k_cache = self.k_layer(k).view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2)
-        #             self.v_cache = self.v_layer(v).view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2)
-                
-        #         k, v = self.k_cache, self.v_cache
-                
-        #     elif self.kv_cache_type == "static":
-        #         # Static cache for cross-attention: compute once and reuse (batch-aware)
-        #         if self.k_cache is None or self.k_cache.size(0) != batch_size:
-        #             # Initialize or reinitialize cache for current batch size
-        #             self.k_cache = self.k_layer(k).view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2)
-        #             self.v_cache = self.v_layer(v).view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2)
-                
-        #         k, v = self.k_cache, self.v_cache
-
-        # else:
-        #     k = self.k_layer(k).view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2)
-        #     v = self.v_layer(v).view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2)
-        if use_cache and self.kv_cache_type:
-            if self.k_cache is not None and self.kv_cache_type == "dynamic":
-                # Append new tokens to existing cache
-                new_k = self.k_layer(k).view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2)
-                new_v = self.v_layer(v).view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2)
-                self.k_cache = torch.cat([self.k_cache, new_k], dim=2)
-                self.v_cache = torch.cat([self.v_cache, new_v], dim=2)
-                
-            if self.k_cache is None:
-                self.k_cache = self.k_layer(k).view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2)
-                self.v_cache = self.v_layer(v).view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2)
-                
-            k, v = self.k_cache, self.v_cache
+        elif self.kv_cache_type == "dynamic" and past_key_values:
+            k_cache, v_cache = past_key_values
+            k_new = self.k_layer(k).view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2) # project input keys
+            v_new = self.v_layer(v).view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2) # project input values
+            k = torch.concat([k_cache, k_new], dim=2) # dim=2?
+            v = torch.concat([v_cache, v_new], dim=2) # dim=2?
 
         else:
-            k = self.k_layer(k).view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2)
-            v = self.v_layer(v).view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2)
-        ############################## KV Cache Implementation (Batch-Aware) ###################################
+            k_new = self.k_layer(k).view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2) # project input keys
+            v_new = self.v_layer(v).view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2) # project input values
+            k, v = k_new, v_new
+
+        key_len = k.size(2)
+        query_len = q.size(2)
+
+        # if self.kv_cache_type == "static":
+        #     print(self.kv_cache_type, past_key_values is None, f"{k.shape=}, {v.shape=}, {q.shape=}")
 
         # compute scores
         q = q / math.sqrt(self.head_size)
@@ -183,81 +139,19 @@ class MultiHeadedAttention(nn.Module):
         context = context.transpose(1, 2).contiguous().view(batch_size, -1, self.num_heads * self.head_size)
 
         output = self.output_layer(context)
+        attention_output_weights = None
+        new_k_v = None, None
 
         if return_weights:
             # average attention weights over heads: [batch_size, query_len, key_len]
             attention_output_weights = attention_weights.view(
                 batch_size, self.num_heads, query_len, key_len
-            )
-            return output, attention_output_weights.sum(dim=1) / self.num_heads
-        return output, None
+            ).sum(dim=1) / self.num_heads
+        if use_cache:
+            new_k_v = k_new, v_new
+        
+        return output, attention_output_weights, new_k_v
     
-    # def forward(
-    #     self,
-    #     k: Tensor,
-    #     v: Tensor,
-    #     q: Tensor,
-    #     mask: Optional[Tensor] = None,
-    #     return_weights: Optional[bool] = None,
-    # ):
-    #     """
-    #     Computes multi-headed attention.
-
-    #     :param k: keys   [batch_size, seq_len, hidden_size]
-    #     :param v: values [batch_size, seq_len, hidden_size]
-    #     :param q: query  [batch_size, seq_len, hidden_size]
-    #     :param mask: optional mask [batch_size, 1, seq_len]
-    #     :param return_weights: whether to return the attention weights,
-    #         averaged over heads.
-    #     :return:
-    #         - output  [batch_size, query_len, hidden_size]
-    #         - attention_weights  [batch_size, query_len, key_len]
-    #     """
-    #     batch_size = k.size(0)
-    #     key_len = k.size(1)
-    #     query_len = q.size(1)
-
-    #     # project the queries (q), keys (k), and values (v)
-    #     k = self.k_layer(k)
-    #     v = self.v_layer(v)
-    #     q = self.q_layer(q)
-
-    #     # reshape q, k, v for our computation to
-    #     # [batch_size, num_heads, seq_len, head_dim]
-    #     k = k.view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2)
-    #     v = v.view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2)
-    #     q = q.view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2)
-
-    #     # compute scores
-    #     q = q / math.sqrt(self.head_size)
-
-    #     # [batch_size, num_heads, query_len, key_len]
-    #     scores = torch.matmul(q, k.transpose(2, 3))
-
-    #     # apply the mask (if we have one)
-    #     # we add a dimension for the heads to it below: [batch_size, 1, 1, key_len]
-    #     if mask is not None:
-    #         scores = scores.masked_fill(~mask.unsqueeze(1), float("-inf"))
-
-    #     # apply attention dropout and compute context vectors.
-    #     attention_weights = self.softmax(scores)
-    #     attention_probs = self.dropout(attention_weights)
-
-    #     # get context vector (select values with attention) and reshape
-    #     # back to [batch_size, query_len, hidden_size]
-    #     context = torch.matmul(attention_probs, v)
-    #     context = context.transpose(1, 2).contiguous().view(batch_size, -1, self.num_heads * self.head_size)
-
-    #     output = self.output_layer(context)
-
-    #     if return_weights:
-    #         # average attention weights over heads: [batch_size, query_len, key_len]
-    #         attention_output_weights = attention_weights.view(
-    #             batch_size, self.num_heads, query_len, key_len
-    #         )
-    #         return output, attention_output_weights.sum(dim=1) / self.num_heads
-    #     return output, None
-
 
 class PositionwiseFeedForward(nn.Module):
     """
@@ -423,7 +317,7 @@ class TransformerEncoderLayer(nn.Module):
         if self._layer_norm_position == "pre":
             x = self.layer_norm(x)
 
-        x, _ = self.src_src_att(x, x, x, mask)
+        x, _, _ = self.src_src_att(x, x, x, mask)
         x = self.dropout(x) + self.alpha * residual
 
         if self._layer_norm_position == "post":
@@ -472,10 +366,8 @@ class TransformerDecoderLayer(nn.Module):
 
         self.use_cache = use_cache
 
-        self.trg_trg_att = MultiHeadedAttention(num_heads, size, dropout=dropout, 
-                                                kv_cache_type=None if not use_cache else "dynamic")
-        self.src_trg_att = MultiHeadedAttention(num_heads, size, dropout=dropout,
-                                                kv_cache_type=None if not use_cache else "static")
+        self.trg_trg_att = MultiHeadedAttention(num_heads, size, dropout=dropout, kv_cache_type="dynamic")
+        self.src_trg_att = MultiHeadedAttention(num_heads, size, dropout=dropout, kv_cache_type="static")
 
         self.feed_forward = PositionwiseFeedForward(
             size,
@@ -506,6 +398,9 @@ class TransformerDecoderLayer(nn.Module):
         src_mask: Tensor,
         trg_mask: Tensor,
         return_attention: bool = False,
+        use_cache: bool = False,
+        past_key_values_self_att: tuple[Tensor, Tensor] = None,
+        past_key_values_cross_att: tuple[Tensor, Tensor] = None,
         **kwargs,
     ) -> Tensor:
         """
@@ -534,7 +429,12 @@ class TransformerDecoderLayer(nn.Module):
         if self._layer_norm_position == "pre":
             x = self.x_layer_norm(x)
 
-        h1, _ = self.trg_trg_att(x, x, x, mask=trg_mask, use_cache=self.use_cache)
+        # trg_trg_keys = x if not past_key_values else torch.concat([past_key_values, x], dim=1) # dim=1?
+        # trg_trg_values = x if not past_key_values else torch.concat([past_key_values, x], dim=1)# dim=1?
+
+        h1, _, new_kv_self = self.trg_trg_att(k=x, v=x, q=x, mask=trg_mask, use_cache=use_cache, past_key_values=past_key_values_self_att)
+        # h1, _ = self.trg_trg_att(k=trg_trg_keys, v=trg_trg_values, q=x, mask=trg_mask, use_cache=use_cache)
+        # h1, _ = self.trg_trg_att(x, x, x, mask=trg_mask, use_cache=self.use_cache)
         h1 = self.dropout(h1) + self.alpha * residual
 
         if self._layer_norm_position == "post":
@@ -545,7 +445,8 @@ class TransformerDecoderLayer(nn.Module):
         if self._layer_norm_position == "pre":
             h1 = self.dec_layer_norm(h1)
 
-        h2, att = self.src_trg_att(memory, memory, h1, mask=src_mask, return_weights=return_attention, use_cache=self.use_cache)
+        h2, att, new_kv_cross = self.src_trg_att(memory, memory, h1, mask=src_mask, return_weights=return_attention, use_cache=use_cache, past_key_values=past_key_values_cross_att)
+        # h2, att, _ = self.src_trg_att(memory, memory, h1, mask=src_mask, return_weights=return_attention)
         h2 = self.dropout(h2) + self.alpha * h1_residual
 
         if self._layer_norm_position == "post":
@@ -554,6 +455,7 @@ class TransformerDecoderLayer(nn.Module):
         # 3. final position-wise feed-forward layer
         out = self.feed_forward(h2)
 
-        if return_attention:
-            return out, att
-        return out, None
+        # if return_attention:
+        #     return out, att
+        # return out, None
+        return out, att, (new_kv_self, new_kv_cross)

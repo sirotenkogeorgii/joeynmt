@@ -13,6 +13,7 @@ from joeynmt.config import ConfigurationError
 from joeynmt.encoders import Encoder
 from joeynmt.helpers import freeze_params, subsequent_mask
 from joeynmt.transformer_layers import PositionalEncoding, TransformerDecoderLayer
+from joeynmt.kv_cache import EncoderDecoderCache
 
 
 class Decoder(nn.Module):
@@ -506,7 +507,6 @@ class TransformerDecoder(Decoder):
         emb_dropout: float = 0.1,
         vocab_size: int = 1,
         freeze: bool = False,
-        use_cache: bool = False,
         **kwargs,
     ):
         """
@@ -520,15 +520,13 @@ class TransformerDecoder(Decoder):
         :param emb_dropout: dropout probability for embeddings
         :param vocab_size: size of the output vocabulary
         :param freeze: set to True keep all decoder parameters fixed
-        :param use_cache: whether to cache keys and values or not 
         :param kwargs:
         """
+        # :param use_cache: whether to cache keys and values or not 
         super().__init__()
 
         self._hidden_size = hidden_size
         self._output_size = vocab_size
-
-        self.use_cache = use_cache
 
         # create num_layers decoder layers and put them in a list
         self.layers = nn.ModuleList([
@@ -539,8 +537,7 @@ class TransformerDecoder(Decoder):
                 dropout=dropout,
                 alpha=kwargs.get("alpha", 1.0),
                 layer_norm=kwargs.get("layer_norm", "post"),
-                activation=kwargs.get("activation", "relu"),
-                use_cache=use_cache
+                activation=kwargs.get("activation", "relu")
             ) for _ in range(num_layers)
         ])
 
@@ -555,17 +552,6 @@ class TransformerDecoder(Decoder):
 
         if freeze:
             freeze_params(self)
-            
-        # Initialize cache position counter (will be batch-aware)
-        if self.use_cache:
-            self._cache_position = None  # Will be initialized per batch
-
-    def clear_cache(self):
-        for layer in self.layers:
-            layer.clear_cache()
-        # Reset position counter for positional encoding
-        if self.use_cache:
-            self._cache_position = None  # Will be re-initialized per batch
 
     def forward(
         self,
@@ -576,6 +562,9 @@ class TransformerDecoder(Decoder):
         unroll_steps: int,
         hidden: Tensor,
         trg_mask: Tensor,
+        use_cache: bool = False,
+        past_key_values: EncoderDecoderCache = None,
+        # cache_type: 
         **kwargs,
     ):
         """
@@ -597,86 +586,103 @@ class TransformerDecoder(Decoder):
             - None
         """
         assert trg_mask is not None, "trg_mask required for Transformer"
+        # print(f"{trg_embed.shape=}, {trg_mask.shape=}")
 
-        # Add position encoding to word embedding
-        # For KV cache, we need to account for the current position (batch-aware)
-        if self.use_cache:
-            batch_size = trg_embed.size(0)
-            seq_len = trg_embed.size(1)
-            
-            # Initialize position counter if needed (batch-aware)
-            if self._cache_position is None:
-                self._cache_position = torch.zeros(batch_size, dtype=torch.long, device=trg_embed.device)
-                # self._cache_position.shape = [batch_size]
-            
+        # src_mask.shape = [bs, 1, src_time_dim]
+        # trg_mask.shape = [bs, trg_time_dim, 1]
 
+        # src_mask = torch.ones(size=(batch_size, 1, src_time_dim)) == 1
+        # trg_mask = torch.ones(size=(batch_size, trg_time_dim, 1)) == 1
 
-            
-            # During incremental generation, adjust position encoding
-            # trg_embed.shape = [bs, seq_len]
-            if seq_len == 1:  # Single token input (incremental)
-                # Extract the correct positional encoding for current position (per batch element)
-                # pe_slices = []
-                # for batch_idx in range(batch_size):
-                #     current_pos = self._cache_position[batch_idx].item()
-                #     pe_slice = self.pe.pe[:, current_pos:current_pos+1]
-                #     pe_slices.append(pe_slice)
-                
-                # # Stack the positional encodings for the batch
-                # pe_batch = torch.cat(pe_slices, dim=0)
-                # x = trg_embed + pe_batch
-                # print(f"{pe_batch.shape=}, {trg_embed.shape=}, {x.shape=}")
-                # # pe_batch.shape=torch.Size([2, 1, 12]), trg_embed.shape=torch.Size([2, 1, 12]), x.shape=torch.Size([2, 1, 12])
-
-                if self._cache_position.size(0) != batch_size:
-                    raise ValueError(f"KV cache batch size mismatch: expected {batch_size}, but got {self._cache_position.size(0)}")
-                
-                pe_batch = self.pe.pe[0, self._cache_position].unsqueeze(1) # shape: [1, bs, emb_dim]
-                x = trg_embed + pe_batch
-                # print(f"{pe_batch.shape=}, {trg_embed.shape=}, {x.shape=}")
-                # pe_batch.shape=torch.Size([1, 2, 12]), trg_embed.shape=torch.Size([2, 1, 12]), x.shape=torch.Size([2, 2, 12])
-                
-                # Increment position counter for each batch element
-                self._cache_position += 1
-            else:
-                # Full sequence input, reset position and use normal PE
-                self._cache_position = torch.full((batch_size,), trg_embed.size(1), 
-                                                dtype=torch.long, device=trg_embed.device)
-                x = self.pe(trg_embed)
+        batch_size, seq_len = trg_embed.size(0), trg_embed.size(1)
+        if past_key_values and past_key_values.has_self_attention_cache():
+            # if past_key_values.size(0) != batch_size:
+            #     raise ValueError(f"KV cache batch size mismatch: expected {batch_size}, but got {past_key_values.size(0)}")
+            # if past_key_values.num_layers != self.num_layers:
+            start_pos = past_key_values.get_positions_offset() # shape: [bs]
         else:
-            # Normal operation without cache
-            x = self.pe(trg_embed)
+            start_pos = torch.zeros(batch_size, dtype=torch.long, device=trg_embed.device) # shape: [bs]
+        
+        pos_embed_to_take_inds = start_pos[:, None] + torch.arange(seq_len)[None, :] # [bs, seq_len] shifted by start_pos
+        x = trg_embed + self.pe.pe[0, pos_embed_to_take_inds, :]
+
+
         if kwargs.get("trg_prompt_mask", None) is not None:  # add trg_prompt_mask
             x = x + kwargs["trg_prompt_mask"]
         x = self.emb_dropout(x)
 
-        """
-        def subsequent_mask(size: int) -> Tensor:
-        # Mask out subsequent positions (to prevent attending to future positions)
-        # Transformer helper function.
-        ones = torch.ones(size, size, dtype=torch.bool)
-        return torch.tril(ones, out=ones).unsqueeze(0)
-        """
+        active_tokens_src_mask = src_mask.squeeze(1)
+        if trg_mask.size(0) != batch_size or trg_mask.dim() == 3:
+            if trg_mask.size(0) != batch_size and trg_mask.size(0) != 1: 
+                raise Exception(f"Target mask has unexpected size: {trg_mask.size(0)} != {batch_size} and {trg_mask.size(0)} != 1.")
+            if trg_mask.size(1) == 1:
+                active_tokens_tgt_mask = trg_mask.squeeze(1).expand(batch_size, -1)
+            elif trg_mask.size(2) == 1:
+                active_tokens_tgt_mask = trg_mask.squeeze(2).expand(batch_size, -1)
+            else:
+                raise Exception(f"Target mask has batch size: {trg_mask.size(0)} != {batch_size}.")
+        else:
+            raise Exception(f"Target mask has unexpected size and shape: {trg_mask.shape}. Expected size is 3.")
 
+
+        
+        # print(f"{active_tokens_tgt_mask.shape=}, {trg_mask.shape=}")
         trg_mask = trg_mask & subsequent_mask(trg_embed.size(1)).type_as(trg_mask)
-        # print(f"[TransformerDecoder.forward] {trg_mask=}")
+        if past_key_values and past_key_values.has_self_attention_cache():
+            active_cache_mask = past_key_values.get_dynamic_active_cache_mask() # [bs, cache_len]
+            trg_mask = torch.concat([active_cache_mask.unsqueeze(1).expand(-1, seq_len, -1), trg_mask], dim=2) # [bs, seq_len_x, seq_len_cache_x]
 
         last_layer = len(self.layers) - 1
         return_attention = kwargs.get("return_attention", False)
+
+        self_kvs, cross_kvs = [], []
+        has_cross_cache_already = bool(past_key_values and past_key_values.has_cross_attention_cache())
         for i, layer in enumerate(self.layers):
-            x, att = layer(
+            # if past_key_values is not None: print(f"{past_key_values.get_cross(i)[0].shape=}, {past_key_values.get_cross(i)[1].shape=}")
+            x, att, new_kv = layer(
                 x=x,
                 memory=encoder_output,
                 src_mask=src_mask,
                 trg_mask=trg_mask,
-                return_attention=(return_attention and i == last_layer)
+                return_attention=(return_attention and i == last_layer),
+                use_cache=use_cache,
+                past_key_values_self_att=None if not past_key_values else past_key_values.get_self(i),
+                past_key_values_cross_att=None if not past_key_values else past_key_values.get_cross(i)
             )
+
+            if use_cache:
+                # new_kv_self, new_kv_cross
+                k_self, v_self = new_kv[0]
+                k_cross, v_cross = new_kv[1]
+                if k_self is not None and v_self is not None:
+                    self_kvs.append((k_self, v_self))
+                if not has_cross_cache_already and k_cross is not None and v_cross is not None:
+                    cross_kvs.append((k_cross, v_cross))
+        
+        if use_cache:
+            # Update or create cache
+            if past_key_values:
+                past_key_values.update_decoder_cache(
+                    new_self_kv=self_kvs if len(self_kvs) > 0 else None,
+                    new_cross_kv=None if past_key_values.has_cross_attention_cache() else (cross_kvs if len(cross_kvs) > 0 else None),
+                    self_valid_token_mask_new=active_tokens_tgt_mask if active_tokens_tgt_mask is not None else None,
+                )
+            else:
+                if len(self_kvs) > 0 or len(cross_kvs) > 0:
+                    past_key_values = EncoderDecoderCache(
+                        self_attention_cache=self_kvs if len(self_kvs) > 0 else None,
+                        cross_attention_cache=cross_kvs if len(cross_kvs) > 0 else None,
+                        self_valid_token_mask=active_tokens_tgt_mask if active_tokens_tgt_mask is not None else None,
+                        cross_valid_token_mask=active_tokens_src_mask if active_tokens_src_mask is not None else None,
+                        self_impl="pointer" if kwargs.get("kv_cache_impl", None) is None else kwargs["kv_cache_impl"]
+                    )
+
 
         if self.layer_norm is not None:
             x = self.layer_norm(x)
 
         out = self.output_layer(x)
-        return out, x, att, None
+        return out, x, att, past_key_values
 
     def __repr__(self):
         return (
@@ -684,6 +690,5 @@ class TransformerDecoder(Decoder):
             f"num_heads={self.layers[0].trg_trg_att.num_heads}, "
             f"alpha={self.layers[0].alpha}, "
             f'layer_norm="{self.layers[0]._layer_norm_position}", '
-            f"activation={self.layers[0].feed_forward.pwff_layer[1]}, "
-            f"use_cache={self.use_cache})"
+            f"activation={self.layers[0].feed_forward.pwff_layer[1]})"
         )

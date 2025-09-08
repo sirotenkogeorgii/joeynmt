@@ -36,7 +36,7 @@ class Model(nn.Module):
         src_embed: Embeddings,
         trg_embed: Embeddings,
         src_vocab: Vocabulary,
-        trg_vocab: Vocabulary,
+        trg_vocab: Vocabulary
     ) -> None:
         """
         Create a new encoder-decoder model
@@ -76,6 +76,7 @@ class Model(nn.Module):
         self._loss_function = XentLoss(
             pad_index=self.pad_index, smoothing=label_smoothing
         )
+
 
     def forward(self,
                 return_type: str = None,

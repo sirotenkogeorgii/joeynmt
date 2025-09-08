@@ -402,7 +402,7 @@ def prepare(args: BaseConfig, rank: int,
     if mode == "train":
         datasets = ["train", "dev", "test"]
     if mode == "test":
-        datasets = ["dev", "test"]
+        datasets = ["train", "dev", "test"]
     if mode == "translate":
         datasets = ["stream"]
 
@@ -485,12 +485,15 @@ def test(
 
     # load the model and data
     if prepared is None:
-        model, _, dev_data, test_data = prepare(args, rank=0, mode="test")
-        data_to_predict = {"dev": dev_data, "test": test_data}
+        # model, _, dev_data, test_data = prepare(args, rank=0, mode="test")
+        # data_to_predict = {"dev": dev_data, "test": test_data}
+        model, train_data, dev_data, test_data = prepare(args, rank=0, mode="test")
+        data_to_predict = {"train": train_data, "dev": dev_data, "test": test_data}
 
     else:  # avoid to load model and data again
         model = prepared["model"]
         data_to_predict = {"dev": prepared["dev"], "test": prepared["test"]}
+        # data_to_predict = {"train": prepared["train"], "dev": dev_data, "test": test_data}
 
     # check options
     if save_attention:
@@ -516,8 +519,16 @@ def test(
 
     # prediction loop over datasets
     for data_set_name, data_set in data_to_predict.items():
+        # print(data_set_name)
         if data_set is not None:
             data_set.reset_indices(random_subset=-1)  # no subsampling in evaluation
+
+            #### For train inference ####
+            # disable train-time filtering/tokenizer dropout for inference on train set
+            original_split = data_set.split
+            if data_set_name == "train":
+                data_set.split = "dev"
+            #### For train inference ####
 
             logger.info(
                 "%s on %s set... (device: %s, n_gpu: %s, use_ddp: %r, fp16: %r)",
@@ -539,6 +550,12 @@ def test(
                 use_cache=cfg["testing"].get("use_cache", False),
                 kv_cache_impl=cfg["testing"].get("kv_cache_impl", None)
             )
+
+            #### For train inference ####
+            # restore original split
+            if data_set_name == "train":
+                data_set.split = original_split
+            #### For train inference ####
 
             if save_attention:
                 if att_scores:

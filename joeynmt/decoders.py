@@ -603,8 +603,10 @@ class TransformerDecoder(Decoder):
         else:
             start_pos = torch.zeros(batch_size, dtype=torch.long, device=trg_embed.device) # shape: [bs]
         
-        pos_embed_to_take_inds = start_pos[:, None] + torch.arange(seq_len)[None, :] # [bs, seq_len] shifted by start_pos
+        pos_embed_to_take_inds = start_pos[:, None] + torch.arange(seq_len, device=trg_embed.device)[None, :] # [bs, seq_len] shifted by start_pos
         x = trg_embed + self.pe.pe[0, pos_embed_to_take_inds, :]
+
+        
 
 
         if kwargs.get("trg_prompt_mask", None) is not None:  # add trg_prompt_mask

@@ -462,14 +462,22 @@ class KVCachePointer(MutableKVCache):
 
 
     def _layer_increase_size(self, layer_i, pad_len):
-            assert 0 <= layer_i < self.num_layers
+            # assert 0 <= layer_i < self.num_layers
             k = self.keys[layer_i]
             v = self.values[layer_i]
-            pad_shape = (k.size(0), k.size(1), pad_len, k.size(3))
-            k_pad = torch.zeros(pad_shape, dtype=k.dtype, device=k.device)
-            v_pad = torch.zeros(pad_shape, dtype=v.dtype, device=v.device)
-            self.keys[layer_i] = torch.cat([k, k_pad], dim=2)
-            self.values[layer_i] = torch.cat([v, v_pad], dim=2)
+            bs, h, old_len, d = k.shape
+            new_len = old_len + pad_len
+
+            k_new = torch.empty((bs, h, new_len, d), dtype=k.dtype, device=k.device)
+            v_new = torch.empty((bs, h, new_len, d), dtype=v.dtype, device=v.device)
+
+            k_new[..., :old_len, :].copy_(k)
+            v_new[..., :old_len, :].copy_(v)
+            k_new[..., old_len:, :].zero_()
+            v_new[..., old_len:, :].zero_()
+
+            self.keys[layer_i] = k_new
+            self.values[layer_i] = v_new
 
 
     def _ensure_capacity(self, needed_len: int) -> None:
@@ -477,7 +485,7 @@ class KVCachePointer(MutableKVCache):
         if needed_len <= self.cache_len:
             return
         # potentially more than needed to create a buffer
-        # new_cache_len = max(needed_len, int(self.cache_len * 1.5) + 256)
+        # new_cache_len = max(needed_len, self.cache_len * 2)
         new_cache_len = needed_len
         pad_len = new_cache_len - self.cache_len
         for i in range(self.num_layers):

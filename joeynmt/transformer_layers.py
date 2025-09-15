@@ -50,22 +50,9 @@ class MultiHeadedAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
 
-        # KV cache part (first draft)
         if kv_cache_type not in ["static", "dynamic", None]:
             raise ValueError('Cache type must be "static", "dynamic", or None.')
         self.kv_cache_type = kv_cache_type
-
-        # if self.kv_cache_type:
-        #     self.register_buffer("k_cache", None, persistent=False)
-        #     self.register_buffer("v_cache", None, persistent=False)
-
-        # 1) in cross-attention kv cache is static that is computed only once
-        # 2) in self-attention kv cache is dynamic that is static only for a prefix in a time step t-1 and is updated every time step
-
-
-    # def clear_cache(self):
-    #     self.k_cache = None
-    #     self.v_cache = None
 
     def forward(
         self,
@@ -103,9 +90,8 @@ class MultiHeadedAttention(nn.Module):
             k_cache, v_cache = past_key_values
             k_new = self.k_layer(k).view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2) # project input keys
             v_new = self.v_layer(v).view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2) # project input values
-            k = torch.concat([k_cache, k_new], dim=2) # dim=2?
-            v = torch.concat([v_cache, v_new], dim=2) # dim=2?
-
+            k = torch.concat([k_cache, k_new], dim=2)
+            v = torch.concat([v_cache, v_new], dim=2)
         else:
             k_new = self.k_layer(k).view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2) # project input keys
             v_new = self.v_layer(v).view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2) # project input values
@@ -113,9 +99,6 @@ class MultiHeadedAttention(nn.Module):
 
         key_len = k.size(2)
         query_len = q.size(2)
-
-        # if self.kv_cache_type == "static":
-        #     print(self.kv_cache_type, past_key_values is None, f"{k.shape=}, {v.shape=}, {q.shape=}")
 
         # compute scores
         q = q / math.sqrt(self.head_size)
@@ -126,7 +109,6 @@ class MultiHeadedAttention(nn.Module):
         # apply the mask (if we have one)
         # we add a dimension for the heads to it below: [batch_size, 1, 1, key_len]
         if mask is not None:
-            # print(f"{q.shape=}, {scores=}, {mask=}, {scores.shape=}, {mask.shape=}, {self.kv_cache_type=}")
             scores = scores.masked_fill(~mask.unsqueeze(1), float("-inf"))
 
         # apply attention dropout and compute context vectors.
@@ -342,8 +324,7 @@ class TransformerDecoderLayer(nn.Module):
         dropout: float = 0.1,
         alpha: float = 1.0,
         layer_norm: str = "post",
-        activation: str = "relu",
-        use_cache: bool = False
+        activation: str = "relu"
     ) -> None:
         """
         Represents a single Transformer decoder layer.
@@ -363,8 +344,6 @@ class TransformerDecoderLayer(nn.Module):
         """
         super().__init__()
         self.size = size
-
-        self.use_cache = use_cache
 
         self.trg_trg_att = MultiHeadedAttention(num_heads, size, dropout=dropout, kv_cache_type="dynamic")
         self.src_trg_att = MultiHeadedAttention(num_heads, size, dropout=dropout, kv_cache_type="static")
@@ -387,9 +366,6 @@ class TransformerDecoderLayer(nn.Module):
         self._layer_norm_position = layer_norm
         assert self._layer_norm_position in {"pre", "post"}
 
-    def clear_cache(self):
-        self.trg_trg_att.clear_cache()
-        self.src_trg_att.clear_cache()
 
     def forward(
         self,
@@ -419,6 +395,9 @@ class TransformerDecoderLayer(nn.Module):
         :param src_mask: source mask
         :param trg_mask: target mask (so as not to condition on future steps)
         :param return_attention: whether to return the attention weights
+        :param use_cache: whether to cache keys and values or not 
+        :param past_key_values_self_att: cached keys and values of the past tokens in the sequence
+        :param past_key_values_cross_att: cached keys and values of the tokens in the source sequence
         :return:
             - output tensor
             - attention weights
@@ -429,12 +408,7 @@ class TransformerDecoderLayer(nn.Module):
         if self._layer_norm_position == "pre":
             x = self.x_layer_norm(x)
 
-        # trg_trg_keys = x if not past_key_values else torch.concat([past_key_values, x], dim=1) # dim=1?
-        # trg_trg_values = x if not past_key_values else torch.concat([past_key_values, x], dim=1)# dim=1?
-
         h1, _, new_kv_self = self.trg_trg_att(k=x, v=x, q=x, mask=trg_mask, use_cache=use_cache, past_key_values=past_key_values_self_att)
-        # h1, _ = self.trg_trg_att(k=trg_trg_keys, v=trg_trg_values, q=x, mask=trg_mask, use_cache=use_cache)
-        # h1, _ = self.trg_trg_att(x, x, x, mask=trg_mask, use_cache=self.use_cache)
         h1 = self.dropout(h1) + self.alpha * residual
 
         if self._layer_norm_position == "post":
@@ -446,7 +420,6 @@ class TransformerDecoderLayer(nn.Module):
             h1 = self.dec_layer_norm(h1)
 
         h2, att, new_kv_cross = self.src_trg_att(memory, memory, h1, mask=src_mask, return_weights=return_attention, use_cache=use_cache, past_key_values=past_key_values_cross_att)
-        # h2, att, _ = self.src_trg_att(memory, memory, h1, mask=src_mask, return_weights=return_attention)
         h2 = self.dropout(h2) + self.alpha * h1_residual
 
         if self._layer_norm_position == "post":
@@ -455,7 +428,4 @@ class TransformerDecoderLayer(nn.Module):
         # 3. final position-wise feed-forward layer
         out = self.feed_forward(h2)
 
-        # if return_attention:
-        #     return out, att
-        # return out, None
         return out, att, (new_kv_self, new_kv_cross)

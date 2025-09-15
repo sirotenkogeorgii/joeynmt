@@ -76,6 +76,8 @@ def predict(
     :param num_workers: number of workers for `collate_fn()` in data iterator
     :param args: configuration args
     :param autocast: autocast context
+    :param use_cache: flag whether to create cache the results or not
+    :param kv_cache_impl: type of the KV cache to use
     :return:
         - valid_scores: (dict) current validation scores,
         - valid_ref: (list of str) post-processed validation references,
@@ -132,7 +134,9 @@ def predict(
             f"max_output_length={args.max_output_length}, "
             f"return_prob='{args.return_prob}', generate_unk={args.generate_unk}, "
             f"repetition_penalty={args.repetition_penalty}, "
-            f"no_repeat_ngram_size={args.no_repeat_ngram_size})"
+            f"no_repeat_ngram_size={args.no_repeat_ngram_size}, "
+            f"use_cache={use_cache}, "
+            f"kv_cache_impl={kv_cache_impl})"
         )
     logger.info("Predicting %d example(s)...%s", num_samples, decoding_description)
 
@@ -402,7 +406,8 @@ def prepare(args: BaseConfig, rank: int,
     if mode == "train":
         datasets = ["train", "dev", "test"]
     if mode == "test":
-        datasets = ["train", "dev", "test"]
+        # datasets = ["train", "dev", "test"]
+        datasets = ["dev", "test"] # for big datasets we exclude train set
     if mode == "translate":
         datasets = ["stream"]
 

@@ -522,7 +522,6 @@ class TransformerDecoder(Decoder):
         :param freeze: set to True keep all decoder parameters fixed
         :param kwargs:
         """
-        # :param use_cache: whether to cache keys and values or not 
         super().__init__()
 
         self._hidden_size = hidden_size
@@ -564,7 +563,6 @@ class TransformerDecoder(Decoder):
         trg_mask: Tensor,
         use_cache: bool = False,
         past_key_values: EncoderDecoderCache = None,
-        # cache_type: 
         **kwargs,
     ):
         """
@@ -578,6 +576,8 @@ class TransformerDecoder(Decoder):
         :param hidden: unused
         :param trg_mask: to mask out target paddings
                          Note that a subsequent mask is applied here.
+        :param use_cache: flag whether to create cache the results or not
+        :param past_key_values: cache keys and values of the previous tokens in the sequence
         :param kwargs:
         :return:
             - decoder_output: shape (batch_size, seq_len, vocab_size)
@@ -586,28 +586,15 @@ class TransformerDecoder(Decoder):
             - None
         """
         assert trg_mask is not None, "trg_mask required for Transformer"
-        # print(f"{trg_embed.shape=}, {trg_mask.shape=}")
-
-        # src_mask.shape = [bs, 1, src_time_dim]
-        # trg_mask.shape = [bs, trg_time_dim, 1]
-
-        # src_mask = torch.ones(size=(batch_size, 1, src_time_dim)) == 1
-        # trg_mask = torch.ones(size=(batch_size, trg_time_dim, 1)) == 1
 
         batch_size, seq_len = trg_embed.size(0), trg_embed.size(1)
         if past_key_values and past_key_values.has_self_attention_cache():
-            # if past_key_values.size(0) != batch_size:
-            #     raise ValueError(f"KV cache batch size mismatch: expected {batch_size}, but got {past_key_values.size(0)}")
-            # if past_key_values.num_layers != self.num_layers:
             start_pos = past_key_values.get_positions_offset() # shape: [bs]
         else:
             start_pos = torch.zeros(batch_size, dtype=torch.long, device=trg_embed.device) # shape: [bs]
         
         pos_embed_to_take_inds = start_pos[:, None] + torch.arange(seq_len, device=trg_embed.device)[None, :] # [bs, seq_len] shifted by start_pos
         x = trg_embed + self.pe.pe[0, pos_embed_to_take_inds, :]
-
-        
-
 
         if kwargs.get("trg_prompt_mask", None) is not None:  # add trg_prompt_mask
             x = x + kwargs["trg_prompt_mask"]
@@ -626,9 +613,6 @@ class TransformerDecoder(Decoder):
         else:
             raise Exception(f"Target mask has unexpected size and shape: {trg_mask.shape}. Expected size is 3.")
 
-
-        
-        # print(f"{active_tokens_tgt_mask.shape=}, {trg_mask.shape=}")
         trg_mask = trg_mask & subsequent_mask(trg_embed.size(1)).type_as(trg_mask)
         if past_key_values and past_key_values.has_self_attention_cache():
             active_cache_mask = past_key_values.get_dynamic_active_cache_mask() # [bs, cache_len]

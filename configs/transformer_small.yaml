@@ -87,6 +87,8 @@ testing:                            # specify which inference algorithm to use f
     sacrebleu_cfg:                  # sacrebleu options
         whitespace: False           # `whitespace` option in sacrebleu.metrics.CHRF() class (default: False)
         tokenize: "13a"             # `tokenize` option in sacrebleu.metrics.BLEU() class (default: 13a)
+    kv_cache_impl: None             # "stack", "pointer"
+    use_cache: False
 
 training:                           # specify training details here
     #load_model: "toy_model/60.ckpt" # if given, load a pre-trained model from this checkpoint
@@ -132,30 +134,30 @@ model:                              # specify your model architecture here
     tied_softmax: True
     encoder:
         type: "transformer"         # encoder type: "recurrent" for LSTM or GRU, or "transformer" for a Transformer
-        num_layers: 3               # number of layers
-        num_heads: 4                # number of transformer heads
+        num_layers: 6               # number of layers
+        num_heads: 8                # number of transformer heads
         embeddings:
-            embedding_dim: 64       # size of embeddings (for Transformer set equal to hidden_size)
+            embedding_dim: 128      # size of embeddings (for Transformer set equal to hidden_size)
             scale: True             # scale the embeddings by sqrt of their size, default: False
             freeze: False           # if True, embeddings are not updated during training
             #load_pretrained: "my_data/train.trg.embed.txt" # path to the pretrained embedding file
-        hidden_size: 64             # size of hidden layer; must be divisible by number of heads
-        ff_size: 128                # size of position-wise feed-forward layer
+        hidden_size: 128            # size of hidden layer; must be divisible by number of heads
+        ff_size: 512                # size of position-wise feed-forward layer
         dropout: 0.1                # apply dropout to the outputs to the transformer, default: 0.0
         freeze: False               # if True, encoder parameters are not updated during training (does not include embedding parameters)
         layer_norm: "pre"           # where to apply layer norm. either "pre" or "post". default "post"
         activation: "relu"          # activation function. choices: "relu", "gelu", "tanh", "swish". default: "relu"
     decoder:
         type: "transformer"         # decoder type: "recurrent" for LSTM or GRU, or "transformer" for a Transformer
-        num_layers: 3               # number of layers
-        num_heads: 4                # number of transformer heads
+        num_layers: 6               # number of layers
+        num_heads: 8                # number of transformer heads
         embeddings:
-            embedding_dim: 64       # size of embeddings (for Transformer set equal to hidden_size)
+            embedding_dim: 128      # size of embeddings (for Transformer set equal to hidden_size)
             scale: True             # scale the embeddings by sqrt of their size, default: False
             freeze: False           # if True, embeddings are not updated during training
             #load_pretrained: "my_data/train.trg.embed.txt" # path to the pretrained embedding file
-        hidden_size: 64             # size of hidden layer; must be divisible by number of heads
-        ff_size: 128                # size of position-wise feed-forward layer
+        hidden_size: 128            # size of hidden layer; must be divisible by number of heads
+        ff_size: 512                # size of position-wise feed-forward layer
         dropout: 0.1                # apply dropout to the outputs to the transformer, default: 0.0
         freeze: False               # if True, decoder parameters are not updated during training (does not include embedding parameters, but attention)
         layer_norm: "pre"           # where to apply layer norm. either "pre" or "post". default "post"

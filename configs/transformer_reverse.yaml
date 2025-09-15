@@ -36,13 +36,19 @@ data:
         eos_id: 3
 
 testing:
-    #load_model: "models/reverse_transformer/best.ckpt"
-    n_best: 2
-    beam_size: 2
+    load_model: "models/reverse_transformer/best.ckpt"
+    
+    use_cache: False
+    kv_cache_impl: None # "stack", "pointer"
+
+    n_best: 1
+    beam_size: 5
+
     beam_alpha: 1.0
     eval_metrics: ["bleu"]
     max_output_length: 30
-    batch_size: 12
+    # batch_size: 12
+    batch_size: 128
     batch_type: "sentence"
     return_prob: "hyp"
     sacrebleu_cfg:

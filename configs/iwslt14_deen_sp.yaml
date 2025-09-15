@@ -111,6 +111,9 @@ training:
     print_valid_sents: [0, 1, 2, 3]
     keep_best_ckpts: 5
 
+    use_cache: False
+    kv_cache_impl: None # "stack", "pointer"
+
 model:
     initializer: "xavier_uniform"
     bias_initializer: "zeros"

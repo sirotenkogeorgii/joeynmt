@@ -624,7 +624,6 @@ class TransformerDecoder(Decoder):
         self_kvs, cross_kvs = [], []
         has_cross_cache_already = bool(past_key_values and past_key_values.has_cross_attention_cache())
         for i, layer in enumerate(self.layers):
-            # if past_key_values is not None: print(f"{past_key_values.get_cross(i)[0].shape=}, {past_key_values.get_cross(i)[1].shape=}")
             x, att, new_kv = layer(
                 x=x,
                 memory=encoder_output,

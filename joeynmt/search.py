@@ -163,7 +163,6 @@ def transformer_greedy(
     model: Model,
     encoder_output: Tensor,
     encoder_hidden: Tensor,
-    # use_cache: bool = False,
     **kwargs,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """
@@ -175,7 +174,6 @@ def transformer_greedy(
     :param model: model to use for greedy decoding
     :param encoder_output: encoder hidden states for attention
     :param encoder_hidden: encoder final state (unused in Transformer)
-    :param use_cache: whether to use KV cache for faster inference
     :return:
         - stacked_output: output hypotheses (2d array of indices),
         - stacked_scores: scores (2d array of token-wise log probabilities),
@@ -789,7 +787,6 @@ def beam_search(
 
         # reorder indices, outputs and masks (and KV cache if used)
         select_indices = batch_index.view(-1)
-        # print(select_indices)
         encoder_output = encoder_output.index_select(0, select_indices)
         src_mask = src_mask.index_select(0, select_indices)
         if is_transformer and use_cache and kv_cache is not None:

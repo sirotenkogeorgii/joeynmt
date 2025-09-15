@@ -12,7 +12,6 @@ class KVCacheImpl(str, Enum):
     stack = "stack"
 
 
-
 class KVCache(ABC):
     keys: List[Tensor]  # len=num_layers, [bs, num_heads, cache_len, dim]
     values: List[Tensor]  # len=num_layers, [bs, num_heads, cache_len, dim]
@@ -20,7 +19,6 @@ class KVCache(ABC):
     batch_size: int
     num_layers: int
     cache_len: int
-    # Number of valid cached time steps per batch element (used for masking and PE shift)
     cache_positions: Tensor  # [bs], dtype=torch.long
 
     def __init__(
@@ -52,21 +50,6 @@ class KVCache(ABC):
         self.num_heads = num_heads
         self.head_dim = head_dim
 
-        # # cache_positions counts how many valid cached steps exist per batch
-        # # For newly created cache, we consider all provided steps valid
-        # if valid_token_mask is not None:
-        #     assert valid_token_mask.dim() == 2 # mask is supposed to be 2D
-
-        #     if valid_token_mask.shape[0] != self.batch_size: # wrong batch size of the valid tokens mask
-        #         raise AssertionError(f"valid_token_mask batch dim {valid_token_mask.shape[0]} != {self.batch_size}")
-            
-        #     assert valid_token_mask.shape[1] == init_len # mask has a valid length
-        #     self.cache_positions = valid_token_mask.to(dtype=torch.long, device=device).sum(dim=1)
-        # else:
-        #     # valid tokens mask is not provided, meaning that all tokens are valid (assumption)
-        #     self.cache_positions = torch.full((self.batch_size,), init_len, dtype=torch.long, device=device)
-
-        # Store rectangular tensors per layer; copy the provided initial content
         self.keys = []
         self.values = []
         for (k_new, v_new) in layers_kv:
@@ -120,13 +103,7 @@ class StaticKVCache(KVCache):
         """
         super().__init__(layers_kv, valid_token_mask)
         
-        # self.batch_size = k0.size(0)
-        # self.num_layers = len(layers_kv)
-        # num_heads = k0.size(1)
-        # init_len = k0.size(2)
-        # head_dim = k0.size(3)
         device = layers_kv[0][0].device
-        # dtype = k0.dtype
 
         if valid_token_mask is not None:
             assert valid_token_mask.dim() == 2
@@ -136,7 +113,7 @@ class StaticKVCache(KVCache):
             assert valid_token_mask.size(1) == self.cache_len
             self.positions_offset = valid_token_mask.to(dtype=torch.long, device=device).sum(dim=1)
         else:
-            # If mask is not provided, assume all initial tokens are valid
+            # all is valid
             self.positions_offset = torch.full((self.batch_size,), self.cache_len, dtype=torch.long, device=device)
 
 
@@ -161,14 +138,12 @@ class StaticKVCache(KVCache):
         index: 1D LongTensor of shape [new_bs]
         """
         assert index.dim() == 1
-        # Reindex per-layer keys/values
         new_layers_kv: List[Tuple[Tensor, Tensor]] = []
         for k, v in zip(self.keys, self.values):
             k_sel = k.index_select(0, index)
             v_sel = v.index_select(0, index)
             new_layers_kv.append((k_sel, v_sel))
 
-        # Reindex validity mask (and thereby positions_offset)
         valid_mask_sel = self.valid_token_mask.index_select(0, index) if hasattr(self, 'valid_token_mask') else None
 
         return StaticKVCache(new_layers_kv, valid_token_mask=valid_mask_sel)    
@@ -193,14 +168,7 @@ class KVCacheStack(MutableKVCache):
         For static caches, entries are fixed and won't be updated.
         """
         super().__init__(layers_kv, valid_token_mask)
-        
-        # self.batch_size = k0.size(0)
-        # self.num_layers = len(layers_kv)
-        # num_heads = k0.size(1)
-        # init_len = k0.size(2)
-        # head_dim = k0.size(3)
         device = layers_kv[0][0].device
-        # dtype = k0.dtype
 
         if valid_token_mask is not None:
             assert valid_token_mask.dim() == 2 # mask is supposed to be 2D
@@ -211,10 +179,9 @@ class KVCacheStack(MutableKVCache):
             assert valid_token_mask.size(1) == self.cache_len # mask has a valid length
             self.valid_token_mask = valid_token_mask.to(device=device)
         else:
-            # valid tokens mask is not provided, meaning that all tokens are valid (assumption)
+            # all is valid
             self.valid_token_mask = torch.ones((self.batch_size, self.cache_len), device=device).bool()
         self.positions_offset = self.valid_token_mask.to(dtype=torch.long, device=device).sum(dim=1)
-        # compatibility alias for older callers
         self.cache_positions = self.positions_offset
 
     def get_positions_offset(self):
@@ -222,13 +189,9 @@ class KVCacheStack(MutableKVCache):
 
     def get_active_cache_mask(self) -> Tensor:
         """Return [bs, cache_len] bool mask: True for active cached positions."""
-        # device = self.keys[0].device
-        # arange = torch.arange(self.cache_len, device=device)
-        # return arange[None, :] < self.cache_positions[:, None]
         return self.valid_token_mask
 
     def update_cache(self, new_self_kv, valid_token_mask_new):
-        # print("KVCacheStack")
         bs, num_heads, seq_new, head_dim = new_self_kv[0][0].shape
 
         if valid_token_mask_new is not None:
@@ -241,7 +204,6 @@ class KVCacheStack(MutableKVCache):
         self.positions_offset += new_offsets
         self.valid_token_mask = torch.cat([self.valid_token_mask, valid_token_mask_new], dim=1)
         self.cache_len += seq_new
-        # keep legacy field in sync
         self.cache_positions = self.positions_offset
 
         for layer_i, (k_new, v_new) in enumerate(new_self_kv):
@@ -277,14 +239,12 @@ class KVCacheStack(MutableKVCache):
         index: 1D LongTensor of shape [new_bs]
         """
         assert index.dim() == 1
-        # Reindex per-layer keys/values
         new_layers_kv: List[Tuple[Tensor, Tensor]] = []
         for k, v in zip(self.keys, self.values):
             k_sel = k.index_select(0, index)
             v_sel = v.index_select(0, index)
             new_layers_kv.append((k_sel, v_sel))
 
-        # Reindex validity mask (and thereby positions_offset)
         valid_mask_sel = self.valid_token_mask.index_select(0, index) if hasattr(self, 'valid_token_mask') else None
 
         return KVCacheStack(new_layers_kv, valid_token_mask=valid_mask_sel)
@@ -309,13 +269,7 @@ class KVCachePointer(MutableKVCache):
         """
         super().__init__(layers_kv, valid_token_mask)
         
-        # self.batch_size = k0.size(0)
-        # self.num_layers = len(layers_kv)
-        # num_heads = k0.size(1)
-        # init_len = k0.size(2)
-        # head_dim = k0.size(3)
         device = layers_kv[0][0].device
-        # dtype = k0.dtype
 
         if valid_token_mask is not None:
             assert valid_token_mask.dim() == 2 # mask is supposed to be 2D
@@ -326,9 +280,7 @@ class KVCachePointer(MutableKVCache):
             assert valid_token_mask.size(1) == self.cache_len # mask has a valid length
             self.positions_offset = valid_token_mask.to(dtype=torch.long, device=device).sum(dim=1)
         else:
-            # valid tokens mask is not provided, meaning that all tokens are valid (assumption)
             self.positions_offset = torch.full((self.batch_size,), self.cache_len, dtype=torch.long, device=device)
-        # compatibility alias for older callers
         self.cache_positions = self.positions_offset
 
 
@@ -339,14 +291,12 @@ class KVCachePointer(MutableKVCache):
         index: 1D LongTensor of shape [new_bs]
         """
         assert index.dim() == 1
-        # Reindex per-layer keys/values
         new_layers_kv: List[Tuple[Tensor, Tensor]] = []
         for k, v in zip(self.keys, self.values):
             k_sel = k.index_select(0, index)
             v_sel = v.index_select(0, index)
             new_layers_kv.append((k_sel, v_sel))
 
-        # Create new cache and preserve positions_offset
         new_cache = KVCachePointer(new_layers_kv, valid_token_mask=None)
         new_cache.positions_offset = self.positions_offset.index_select(0, index)
         return new_cache
@@ -356,7 +306,6 @@ class KVCachePointer(MutableKVCache):
 
     
     def update_cache(self, new_self_kv, valid_token_mask_new):
-        # print("KVCachePointer")
         bs, num_heads, seq_new, head_dim = new_self_kv[0][0].shape
 
         if valid_token_mask_new is not None:
@@ -367,17 +316,13 @@ class KVCachePointer(MutableKVCache):
             valid_token_mask_new = torch.ones((self.batch_size, seq_new), device=new_self_kv[0][0].device).bool()
             new_lengths = torch.full((bs,), seq_new, dtype=torch.long, device=new_self_kv[0][0].device)
 
-        # Ensure capacity to accommodate writes
         needed_len = int((self.positions_offset + new_lengths).max().item())
         self._ensure_capacity(needed_len)
 
-        # Write per layer (vectorized)
         for layer_i, (k_new, v_new) in enumerate(new_self_kv):
             self._update_layer(layer_i, k_new, v_new, valid_token_mask_new=valid_token_mask_new)
 
-        # Advance positions
         self.positions_offset = self.positions_offset + new_lengths.to(self.positions_offset.device)
-        # compatibility alias update
         self.cache_positions = self.positions_offset
 
 
@@ -400,18 +345,6 @@ class KVCachePointer(MutableKVCache):
         device = k_new.device
         assert self.cache_len > 0, "cache_len must be > 0"
 
-        # Time-valid mask [bs, seq_new]
-        if valid_token_mask_new is None:
-            time_valid = torch.ones((bs, seq_new), dtype=torch.bool, device=device)
-        else:
-            assert valid_token_mask_new.shape == (bs, seq_new)
-            time_valid = valid_token_mask_new.to(dtype=torch.bool, device=device)
-
-        
-        # NOTE: one-liner that is trying to replace the code above. Remove if unsuccessful
-        # target_idx = self.positions_offset.to(device)[:, None] + torch.arange(seq_new)[None, :]
-
-        # Flatten batch*heads for scatter
         bh = bs * num_heads
         k_dest = self.keys[layer_i]
         v_dest = self.values[layer_i]
@@ -424,24 +357,20 @@ class KVCachePointer(MutableKVCache):
         all_valid = (valid_token_mask_new is None) or valid_token_mask_new.all()
         starts = self.positions_offset  # [bs]
 
-        if all_valid:
-            # Case 1: all batches aligned → one big contiguous copy
+        if all_valid: # optimization to not create large temp tensors like in the "else" branch
             if torch.equal(starts, starts[0].expand_as(starts)):
                 s = int(starts[0].item())
                 k_dest_flat[:, s:s+seq_new, :].copy_(k_src_flat)
                 v_dest_flat[:, s:s+seq_new, :].copy_(v_src_flat)
             else:
-                # Case 2: few distinct starts → group and copy per group
                 uniq, inv = torch.unique(starts, return_inverse=True)
                 for g, s in enumerate(uniq.tolist()):
                     row_idx = torch.where(inv == g)[0]              # batches with same start
                     rr = row_idx.repeat_interleave(num_heads)       # expand to BH rows
                     s = int(s)
-                    # copy_ is much faster than scatter_ when writing contiguous blocks
                     k_dest_flat[rr, s:s+seq_new, :].copy_(k_src_flat[rr])
                     v_dest_flat[rr, s:s+seq_new, :].copy_(v_src_flat[rr])
         else:
-            # Fallback: masked per-element write only when you truly need it
             time_valid = valid_token_mask_new.to(k_new.device, torch.bool)
             local_idx = time_valid.long().cumsum(1) - 1
             local_idx = local_idx.masked_fill(~time_valid, 0)
@@ -456,13 +385,11 @@ class KVCachePointer(MutableKVCache):
             k_dest_flat[rows, cols] = k_src_flat[mask_flat]
             v_dest_flat[rows, cols] = v_src_flat[mask_flat]
 
-        # Save back
         self.keys[layer_i] = k_dest_flat.view(bs, num_heads, self.cache_len, head_dim)
         self.values[layer_i] = v_dest_flat.view(bs, num_heads, self.cache_len, head_dim)
 
 
     def _layer_increase_size(self, layer_i, pad_len):
-            # assert 0 <= layer_i < self.num_layers
             k = self.keys[layer_i]
             v = self.values[layer_i]
             bs, h, old_len, d = k.shape
@@ -518,8 +445,6 @@ class EncoderDecoderCache:
         """
         Wrapper holding self- and cross-attention caches.
         """
-        # print(f"{self_impl=}")
-        # NEW: normalize and store impl for future cache (re)creation
         self.self_impl = KVCacheImpl(self_impl) if isinstance(self_impl, str) else self_impl
 
         # Self-attention cache (dynamic)
@@ -595,7 +520,6 @@ class EncoderDecoderCache:
         self_cache = self.self_attention_cache.index_select(index) if self.has_self_attention_cache() else None
         cross_cache = self.cross_attention_cache.index_select(index) if self.has_cross_attention_cache() else None
 
-        # Derive corresponding valid masks if present
         self_valid = self_cache.valid_token_mask if self_cache is not None else None
         cross_valid = cross_cache.valid_token_mask if cross_cache is not None else None
 
